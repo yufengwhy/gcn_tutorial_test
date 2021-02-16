@@ -1,0 +1,5 @@
+### Ignore all nii files
+*.nii
+
+### Ignore all pkl files
+*.pkl
