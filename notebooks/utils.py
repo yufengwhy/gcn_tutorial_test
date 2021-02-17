@@ -72,6 +72,7 @@ def add_self_loops(edge_index, edge_weight=None, fill_value=1, num_nodes=None):
     loop_index = loop_index.unsqueeze(0).repeat(2, 1)
 
     if edge_weight is not None:
+        # print('-----yufeng-----', edge_weight.size(), edge_index.size())
         assert edge_weight.numel() == edge_index.size(1)
         loop_weight = edge_weight.new_full((num_nodes, ), fill_value)
         edge_weight = torch.cat([edge_weight, loop_weight], dim=0)
@@ -155,6 +156,34 @@ def load_fmri_data_from_lmdb(lmdb_filename,fmri_files=None,fmri_data_clean=None,
     lmdb_env.close()
 
     return matrix_dict, fmri_sub_name
+
+
+##load fmri data from array
+class HH_taskfmri_matrix_datasets(Dataset):
+    ##build a new class for own dataset
+    import numpy as np
+    def __init__(self, label_matrix, fmri_data_matrix, adj_matrix,
+                 isTrain='train', transform=False):
+        super(HH_taskfmri_matrix_datasets, self).__init__()
+        self.label_matrix = label_matrix
+        self.fmri_data_matrix = fmri_data_matrix
+        self.adj_matrix = adj_matrix
+        self.Subject_Num = self.fmri_data_matrix.shape[0]
+        self.Region_Num = self.fmri_data_matrix[0].shape[-1]
+        self.data_type = isTrain
+        self.transform = transform
+
+    def __len__(self):
+        return self.Subject_Num
+
+    def __getitem__(self, idx):
+        # step1: get one subject data & transform to torch tensors
+        label_data = torch.LongTensor(self.label_matrix[idx])
+        fmri_data = torch.FloatTensor(self.fmri_data_matrix[idx])
+        adj_data = torch.FloatTensor(self.adj_matrix[idx])
+        # print(idx,label_data.shape,fmri_data.shape,adj_data.shape)
+        return label_data, fmri_data, adj_data
+
 
 ##load fmri data from array
 class HCP_taskfmri_matrix_datasets(Dataset):

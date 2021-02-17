@@ -7,6 +7,8 @@
 ###define model for training
 import time
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy import sparse
 
 import torch
 import torch.nn as nn
@@ -18,6 +20,37 @@ from torch_scatter import scatter_add
 ##from torch_geometric.utils import add_self_loops
 from utils import add_self_loops
 
+def sparse_adjacency(adj_mat):
+    """Return the adjacency matrix of a kNN graph."""
+    Nneighbours=8
+    idx = np.argsort(-adj_mat)[:, 0:Nneighbours]  #降序取最大的Nneighbours个
+    dist = np.array([adj_mat[i, idx[i]] for i in range(adj_mat.shape[0])])
+    dist[dist < 0.1] = 0
+    M, k = dist.shape
+    assert M, k == idx.shape
+    assert dist.min() >= 0  # elements in matrix must >=0 ?
+    # Weights.
+    # sigma2 = np.mean(dist[:, -1])**2  # the square of the last column
+    # dist = np.exp(- dist**2 / sigma2)  # why? Larger connectivity, smaller distance?
+    # Weight matrix.
+    I = np.arange(0, M).repeat(k)
+    J = idx.reshape(M*k)
+    V = dist.reshape(M*k)
+    W = sparse.coo_matrix((V, (I, J)), shape=(M, M))
+    # No self-connections.
+    W.setdiag(0)    # set the diagonal value=0
+    # Non-directed graph.
+    bigger = W.T > W
+    W = W - W.multiply(bigger) + W.T.multiply(bigger)  # choose the bigger one between W(i,j) and W(j,i)
+    return W
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    """Convert a scipy sparse matrix to a torch sparse tensor."""
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
 
 class FCN(nn.Module):
 ###fully-connected
@@ -342,3 +375,123 @@ def model_fit_evaluate(model,adj_mat,device,train_loader,test_loader,optimizer,l
 
     print("best testing accuarcy:",best_acc)
     plot_history(model_history)
+
+def model_fit_evaluate2(model,device,train_loader,test_loader,optimizer,loss_func,num_epochs=100):
+    best_loss = 1000000
+    model_history={}
+    model_history['train_loss']=[];
+    model_history['test_loss']=[];
+    for epoch in range(num_epochs):
+        train_loss =train2(model, device, train_loader, optimizer,loss_func, epoch)
+        model_history['train_loss'].append(train_loss)
+
+        test_loss = test2(model, device, test_loader,loss_func)
+        model_history['test_loss'].append(test_loss)
+
+        if test_loss < best_loss:
+            best_loss = test_loss
+            print("Model updated: Best-Loss = {:4f}".format(best_loss))
+
+    print("best testing loss:",best_loss)
+    plot_history(model_history)
+
+
+##training the model
+def train2(model, device, train_loader, optimizer, loss_func, epoch):
+    model.train()
+
+    train_loss = 0.
+    total = 0
+    t0 = time.time()
+    for batch_idx, (target, data, adj_mat) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        adj_mat = sparse_mx_to_torch_sparse_tensor(sparse_adjacency(adj_mat.cpu().numpy()[0])).to(device)
+        # adj_mat = torch.topk(adj_mat.to(device), 8)
+        optimizer.zero_grad()
+        out = model(data, adj_mat)
+        loss = loss_func(out.to(torch.float32), target.to(torch.float32))
+
+        total += target.size(0)
+        train_loss += loss.sum().item()
+        # print('---------yufeng out, loss, total, train_loss', out, loss, total, train_loss)
+        loss.backward()
+        optimizer.step()
+
+    print("\nEpoch {}: \nTime Usage:{:4f} | Training Loss {:4f} ".format(epoch, time.time() - t0,
+                                                                                    train_loss / total))
+    return train_loss / total
+
+
+def test2(model, device, test_loader, loss_func):
+    model.eval()
+    test_loss = 0.
+    total = 0
+    ##no gradient desend for testing
+    with torch.no_grad():
+        for target, data, adj_mat in test_loader:
+            data, target = data.to(device), target.to(device)
+            adj_mat = sparse_mx_to_torch_sparse_tensor(sparse_adjacency(adj_mat.cpu().numpy()[0])).to(device)
+            # adj_mat = torch.topk(adj_mat.to(device), 8)
+            out = model(data, adj_mat)
+
+            loss = loss_func(out.to(torch.float32), target.to(torch.float32))
+            test_loss += loss.sum().item()
+            total += target.size(0)
+
+    test_loss /= total
+    print('Test Loss {:4f} '.format(test_loss))
+    return test_loss
+
+class ChebNet2(nn.Module):
+    def __init__(self, nfeat, nfilters, nclass, K=2, nodes=360, nhid=128, gcn_layer=2, dropout=0, gcn_flag=False):
+        super(ChebNet2, self).__init__()
+        self.gcn_layer = gcn_layer
+
+        ####feature extracter
+        self.graph_features = nn.ModuleList()
+        if gcn_flag is True:
+            print('Using GCN Layers instead')
+            self.graph_features.append(GraphConv(nfeat, nfilters))
+        else:
+            self.graph_features.append(ChebConv(nfeat, nfilters, K))
+        for i in range(gcn_layer):
+            if gcn_flag is True:
+                self.graph_features.append(GraphConv(nfilters, nfilters))
+            else:
+                self.graph_features.append(ChebConv(nfilters, nfilters, K))
+
+
+        if dropout > 0:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = nn.Identity(dropout)
+
+        # Define the output layer
+        self.graph_nodes = nodes
+        self.hidden_size = self.graph_nodes
+        self.pool = nn.AdaptiveMaxPool2d((self.hidden_size,1))
+
+        self.linear = nn.Linear(self.hidden_size, nclass)
+        self.hidden2label = nn.Sequential(
+            nn.Linear(self.hidden_size, nhid),
+            nn.ReLU(True),
+            nn.Dropout(p=0.25),
+            nn.Linear(nhid, nhid // 4),
+            nn.ReLU(True),
+            nn.Dropout(p=0.5),
+            nn.Linear(nhid // 4, nclass),
+        )
+    def forward(self, inputs, adj_mat):
+        edge_index = adj_mat._indices()
+        edge_weight = adj_mat._values()
+        batch = inputs.size(0)
+        ###gcn layer
+        x = inputs
+        for layer in self.graph_features:
+            x = F.relu(layer(x, edge_index, edge_weight))
+            x = self.dropout(x)
+        x = self.pool(x)
+        ###linear dense layer
+        # y_pred = self.linear(x.view(batch,-1))
+        y_pred = self.hidden2label(x.view(batch, -1))
+        return y_pred
